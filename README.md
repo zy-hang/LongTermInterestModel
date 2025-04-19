@@ -123,17 +123,15 @@ pip install -r requirements.txt
 python scripts/train.py \
   --data_path DATA/train_user \
   --save_dir saved_models \
-  --epochs 10 \               # ★ 已由原来的 5 增至 10，推荐结合 early stopping
+  --epochs 100 \              
   --batch_size 256 \
-  --lr 1e-3 \
-  --warmup_steps 1000 \       # ★ 新增学习率预热
-  --early_stop_patience 3     # ★ 新增早停机制
+  --lr 1e-3 \     
 ```
 
 - **损失**：BPR loss（三元组）
 - **优化器**：AdamW + 权重衰减
 - **学习率调度**：线性 warm‑up + 余弦衰减
-- **监控指标**：平均 BPR loss，Hit Rate，NDCG
+- **监控指标**：平均 BPR loss
 - **Checkpoint**：每隔 1 epoch 执行一次验证，结合早停保存最佳模型
 
 ---
