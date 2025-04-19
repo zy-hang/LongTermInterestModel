@@ -1,0 +1,25 @@
+# requirements.txt
+
+# Python version
+python >=3.8,<3.12
+
+# Core dependencies
+numpy >=1.19.5
+pandas >=1.1.5
+scikit‑learn >=0.24.2
+tqdm >=4.62.0
+redis >=3.5.3
+
+# PyTorch and related (includes torch.distributed, torch.nn, DataLoader, etc.)
+torch >=1.9.0,<2.1.0
+torchvision >=0.10.0   # 如果需要计算机视觉模块
+# torchtext >=0.10.0   # 如果需要自然语言处理模块（可选）
+
+# 类型扩展（Literal、Protocol 等，如果你开启严格类型检查）
+typing‑extensions >=3.10.0.2
+
+# （可选）用于配置管理、日志、可视化等
+# pyyaml >=5.4.1
+# tensorboard >=2.5.0
+# wandb >=0.12.0
+
