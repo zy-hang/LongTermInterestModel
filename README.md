@@ -58,8 +58,7 @@
 │   ├── long_term.pth         # 长期塔模型权重
 │   ├── short_term.pth        # 短期塔模型权重
 │   └── moe_layer.pth         # MoE层模型权重
-├── scripts/            
-│   └── train.py              # 端到端训练 & Redis 导出脚本
+├── train.py                  # 端到端训练 & Redis 导出脚本
 ├── LongTermInterestModel.py  # 双塔 Transformer 模型定义
 ├── DeepSeekMoE.py            # 带负载均衡的混合专家网络实现
 ├── requirements.txt          # 依赖列表
