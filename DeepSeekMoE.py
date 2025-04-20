@@ -112,7 +112,6 @@ class RMSNorm(nn.Module):
 class Gate(nn.Module):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
-
     Attributes:
         dim (int): Dimensionality of input features.
         topk (int): Number of top experts activated for each input.
@@ -127,7 +126,6 @@ class Gate(nn.Module):
     def __init__(self, args: ModelArgs = ModelArgs()):
         """
         Initializes the Gate module.
-
         Args:
             args (ModelArgs): Model arguments containing gating parameters.
         """
@@ -140,7 +138,6 @@ class Gate(nn.Module):
         self.route_scale = args.route_scale
         self.gate_weights = nn.Linear(args.dim, args.n_routed_experts)
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
-
         # 添加专家使用频率统计
         self.register_buffer('expert_activation_counts', torch.zeros(args.n_routed_experts))
         self.register_buffer('expert_percentages', torch.ones(args.n_routed_experts))
@@ -163,31 +160,41 @@ class Gate(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the gating mechanism.
-
         Args:
             x (torch.Tensor): Input tensor.
-
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
+        # 计算初始路由分数
         scores = self.gate_weights(x)
+        # 根据scoring函数选择不同的激活方式
+        if self.score_func == "sigmoid":
+            # 先计算激活值
+            original_scores = scores.sigmoid()
 
-        # 如果在训练模式且启用负载均衡,应用负载均衡修正
-        if self.training and self.use_load_balancing:
-            # 对scores进行sigmoid操作
-            scores = scores.sigmoid()
-
-            # 使用专家百分比进行负载均衡调整
-            # 百分比越高的专家,其score越小
-            scores = scores / self.expert_percentages.to(scores.device)
-        else:
-            scores = scores.sigmoid()
-
+            # 如果在训练模式且启用负载均衡,应用负载均衡修正
+            if self.training and self.use_load_balancing:
+                # 使用专家百分比进行负载均衡调整
+                # 百分比越高的专家,其score越小
+                balanced_scores = original_scores / self.expert_percentages.to(scores.device)
+                scores = balanced_scores
+            else:
+                scores = original_scores
+        else:  # "softmax"
+            # 对于softmax,我们在计算exp之后应用负载均衡
+            if self.training and self.use_load_balancing:
+                # 计算exp值
+                exp_scores = torch.exp(scores)
+                # 应用负载均衡,除以专家激活百分比
+                balanced_exp_scores = exp_scores / self.expert_percentages.to(scores.device).unsqueeze(0)
+                # 重新归一化
+                scores = balanced_exp_scores / balanced_exp_scores.sum(dim=-1, keepdim=True)
+            else:
+                scores = F.softmax(scores, dim=-1)
+        # 保存原始分数用于返回权重
         original_scores = scores
-
         if self.bias is not None:
             scores = scores + self.bias
-
         if self.n_groups > 1:
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
@@ -197,15 +204,14 @@ class Gate(nn.Module):
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-
+        # 选出前k个专家
         indices = torch.topk(scores, self.topk, dim=-1)[1]
+        # 获取这些专家对应的权重
         weights = original_scores.gather(1, indices)
-
+        # 如果使用sigmoid激活,需要重新归一化权重
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
-
         weights *= self.route_scale
-
         # 在训练阶段统计专家激活次数
         if self.training:
             # 获取选中的每个专家的索引
@@ -215,7 +221,6 @@ class Gate(nn.Module):
                 self.expert_activation_counts[expert_idx] += (flat_indices == expert_idx).sum().item()
             # 更新总激活次数
             self.total_activations += flat_indices.size(0)
-
         return weights.type_as(x), indices
 
 
