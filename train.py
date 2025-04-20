@@ -269,142 +269,163 @@ class FeatureEmbedding(nn.Module):
 
 
 # -------------------
-# 5. 构建模型和优化器
+# 5. 双塔模型定义
 # -------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class DualTowerModel(nn.Module):
+    def __init__(self, n_items, n_categories, hidden_dim=HIDDEN_DIM, depth=DEPTH, heads=HEADS, dim_head=DIM_HEAD,
+                 dropout=DROPOUT):
+        super().__init__()
+        self.feature_embedding = FeatureEmbedding(n_items, n_categories)
 
-# 特征嵌入层
-feature_embedding = FeatureEmbedding(n_items, n_categories).to(device)
+        # 长期兴趣塔 - 使用LongTermInterestEncoder
+        self.long_tower = LongTermInterestEncoder(
+            dims=TOTAL_EMBEDDING_DIM,
+            output_dim=hidden_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout
+        )
 
-# 创建 MoE 模型参数
-moe_args = ModelArgs(
-    dim=TOTAL_EMBEDDING_DIM,
-    inter_dim=MOE_HIDDEN,
-    moe_inter_dim=MOE_HIDDEN,
-    n_routed_experts=MOE_EXPERTS,
-    n_activated_experts=MOE_ACTIVATED
-)
+        # 短期兴趣塔 - 同样使用LongTermInterestEncoder架构
+        self.short_tower = LongTermInterestEncoder(
+            dims=TOTAL_EMBEDDING_DIM,
+            output_dim=hidden_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout
+        )
 
-# 长短期双塔
-model_long = LongTermInterestEncoder(
-    dims=TOTAL_EMBEDDING_DIM,
-    output_dim=HIDDEN_DIM,
-    depth=DEPTH,
-    heads=HEADS,
-    dim_head=DIM_HEAD,
-    dropout=DROPOUT
-).to(device)
+    def forward(self, long_features, short_features):
+        # 特征嵌入
+        long_emb = self.feature_embedding(long_features)  # [B, L, D]
+        short_emb = self.feature_embedding(short_features)  # [B, K, D]
 
-model_short = LongTermInterestEncoder(
-    dims=TOTAL_EMBEDDING_DIM,
-    output_dim=HIDDEN_DIM,
-    depth=DEPTH,
-    heads=HEADS,
-    dim_head=DIM_HEAD,
-    dropout=DROPOUT
-).to(device)
+        # 通过各自的塔获取表征
+        long_repr = self.long_tower(long_emb)  # [B, hidden_dim]
+        short_repr = self.short_tower(short_emb)  # [B, hidden_dim]
 
-# 创建 MoE 层
-moe_layer = MoE(moe_args).to(device)
+        return long_repr, short_repr
 
-# 优化器
-optim_all = torch.optim.Adam(
-    list(feature_embedding.parameters()) +
-    list(model_long.parameters()) +
-    list(model_short.parameters()) +
-    list(moe_layer.parameters()),
-    lr=LR
-)
+    def update_moe_balancing(self):
+        """更新所有MoE层的负载均衡统计"""
+        self.long_tower.update_moe_balancing()
+        self.short_tower.update_moe_balancing()
 
-
-# -------------------
-# 6. BPR Loss 定义
-# -------------------
-def bpr_loss(pos_sim, neg_sim):
-    # -log sigmoid(pos - neg)
-    return -F.logsigmoid(pos_sim - neg_sim).mean()
+    def reset_moe_counts(self):
+        """重置所有MoE层的专家激活计数"""
+        self.long_tower.reset_moe_counts()
+        self.short_tower.reset_moe_counts()
 
 
 # -------------------
-# 7. 训练循环
+# 6. BPR损失函数
 # -------------------
-dataset = BPRDataset(user_seqs)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=4)
+class BPRLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
 
-for epoch in range(1, EPOCHS + 1):
-    model_long.train()
-    model_short.train()
-    feature_embedding.train()
-    moe_layer.train()
+    def forward(self, anchor, positive, negative):
+        """
+        计算BPR损失
+        参数:
+            anchor: 长期兴趣表征 [B, D]
+            positive: 正样本，同一用户的短期兴趣表征 [B, D]
+            negative: 负样本，其他用户的短期兴趣表征 [B, D]
+        """
+        pos_score = F.cosine_similarity(anchor, positive, dim=1)
+        neg_score = F.cosine_similarity(anchor, negative, dim=1)
 
-    # 在每个 epoch 开始时重置 MoE 专家计数
-    moe_layer.reset_counts()
+        # BPR损失: -log(sigmoid(pos_score - neg_score))
+        loss = -F.logsigmoid(pos_score - neg_score).mean()
 
+        return loss
+
+
+# -------------------
+# 7. 训练函数
+# -------------------
+def train(model, train_loader, optimizer, criterion, device):
+    model.train()
     total_loss = 0
 
-    with tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}") as pbar:
-        for la, sa, sb in pbar:
-            # 将所有特征移到设备上
-            la = {k: v.to(device) for k, v in la.items()}
-            sa = {k: v.to(device) for k, v in sa.items()}
-            sb = {k: v.to(device) for k, v in sb.items()}
+    # 使用tqdm创建进度条
+    progress_bar = tqdm(train_loader)
+    for la, sa, sb in progress_bar:
+        # 将数据移到指定设备
+        for key in la:
+            la[key] = la[key].to(device)
+            sa[key] = sa[key].to(device)
+            sb[key] = sb[key].to(device)
 
-            # 特征嵌入处理
-            la_emb = feature_embedding(la)  # [B, N, D]
-            sa_emb = feature_embedding(sa)  # [B, K, D]
-            sb_emb = feature_embedding(sb)  # [B, K, D]
+        # 前向传播
+        long_repr, short_repr = model(la, sa)
+        _, neg_repr = model(la, sb)
 
-            # 经过 MoE 层处理
-            la_emb = moe_layer(la_emb)
-            sa_emb = moe_layer(sa_emb)
-            sb_emb = moe_layer(sb_emb)
+        # 计算损失
+        loss = criterion(long_repr, short_repr, neg_repr)
 
-            # 双塔前向传播
-            u_long = model_long(la_emb)  # [B, H]
-            u_pos = model_short(sa_emb)  # [B, H]
-            u_neg = model_short(sb_emb)  # [B, H]
+        # 反向传播和优化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-            # 余弦相似度
-            pos_sim = F.cosine_similarity(u_long, u_pos, dim=-1)
-            neg_sim = F.cosine_similarity(u_long, u_neg, dim=-1)
+        total_loss += loss.item()
+        progress_bar.set_description(f"Loss: {loss.item():.4f}")
+
+    return total_loss / len(train_loader)
+
+
+# -------------------
+# 8. 验证函数
+# -------------------
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for la, sa, sb in val_loader:
+            # 将数据移到指定设备
+            for key in la:
+                la[key] = la[key].to(device)
+                sa[key] = sa[key].to(device)
+                sb[key] = sb[key].to(device)
+
+            # 前向传播
+            long_repr, short_repr = model(la, sa)
+            _, neg_repr = model(la, sb)
 
             # 计算损失
-            loss = bpr_loss(pos_sim, neg_sim)
+            loss = criterion(long_repr, short_repr, neg_repr)
+            total_loss += loss.item()
 
-            # 反向传播
-            optim_all.zero_grad()
-            loss.backward()
-            optim_all.step()
+    return total_loss / len(val_loader)
 
-            total_loss += loss.item() * la['items'].size(0)
-            pbar.set_postfix(loss=total_loss / ((pbar.n + 1) * BATCH_SIZE))
 
-    # 在每个 epoch 结束时更新专家使用百分比，用于下一个 epoch 的负载均衡
-    moe_layer.update_expert_percentages()
+# -------------------
+# 9. 离线生成用户长期兴趣向量
+# -------------------
+def generate_user_representations(model, user_seqs, device):
+    model.eval()
+    user_reprs = {}
 
-    # 打印专家使用情况
-    expert_usage = moe_layer.gate.expert_percentages.cpu().numpy()
-    expert_info = ", ".join([f"E{i}: {p:.2%}" for i, p in enumerate(expert_usage)])
-    print(f"专家使用分布: {expert_info}")
-
-    print(f"Epoch {epoch} 完成, 平均 Loss = {total_loss / len(dataset):.4f}")
-    
-    # -------------------
-    # 8. 离线生成并写入 Redis
-    # -------------------
-    print("生成所有用户的长期兴趣 embedding 并写入 Redis...")
-    model_long.eval()
-    feature_embedding.eval()
-    moe_layer.eval()
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
-    # 确保模型目录存在
-    os.makedirs(MODEL_DIR, exist_ok=True)
     with torch.no_grad():
-        for u, seq in tqdm(user_seqs.items()):
-            # 将序列转换为模型输入格式
-            padded_seq = seq + [(0, 0, 0, 0, 0, 0, 0.0, 0.0)] * (N_MIN - len(seq)) if len(seq) < N_MIN else seq[-N_MIN:]
-            items, categories, weekdays, hours, behaviors, is_weekends, days_norm, days_to_end = zip(*padded_seq)
-            # 准备输入特征
+        for user_id, seq in tqdm(user_seqs.items(), desc="生成用户表征"):
+            if len(seq) < 20:  # 确保有足够的行为序列
+                continue
+
+            # 处理序列
+            if len(seq) > N_MIN:
+                feature_seq = seq[:N_MIN]  # 使用最早的N_MIN个行为
+            else:
+                # padding
+                pad_tuple = (0, 0, 0, 0, 0, 0, 0.0, 0.0)
+                feature_seq = seq + [pad_tuple] * (N_MIN - len(seq))
+
+            # 转换为张量
+            items, categories, weekdays, hours, behaviors, is_weekends, days_norm, days_to_end = zip(*feature_seq)
             features = {
                 'items': torch.LongTensor(items).unsqueeze(0).to(device),
                 'categories': torch.LongTensor(categories).unsqueeze(0).to(device),
@@ -415,20 +436,129 @@ for epoch in range(1, EPOCHS + 1):
                 'days_norm': torch.FloatTensor(days_norm).unsqueeze(0).to(device),
                 'days_to_end': torch.FloatTensor(days_to_end).unsqueeze(0).to(device)
             }
-            # 特征嵌入
-            seq_emb = feature_embedding(features)  # [1, N, D]
 
-            # 通过 MoE 层处理
-            seq_emb = moe_layer(seq_emb)
+            # 仅使用长期塔获取表征
+            feature_emb = model.feature_embedding(features)
+            long_repr = model.long_tower(feature_emb)
 
-            # 获取长期兴趣向量
-            u_emb = model_long(seq_emb).squeeze(0).cpu().numpy()  # [H]
-            # 存入Redis：以用户原始ID为key，值为JSON列表
-            raw_u = le_user.inverse_transform([u])[0]
-            r.set(raw_u, json.dumps(u_emb.tolist()))
-    print("全部完成，模型权重保存在", MODEL_DIR)
-    # 保存模型权重
-    torch.save(feature_embedding.state_dict(), os.path.join(MODEL_DIR, "feature_embedding.pth"))
-    torch.save(model_long.state_dict(), os.path.join(MODEL_DIR, "long_term.pth"))
-    torch.save(model_short.state_dict(), os.path.join(MODEL_DIR, "short_term.pth"))
-    torch.save(moe_layer.state_dict(), os.path.join(MODEL_DIR, "moe_layer.pth"))
+            # 存储表征
+            user_reprs[user_id] = long_repr.cpu().numpy().tolist()[0]
+
+    return user_reprs
+
+
+# -------------------
+# 10. 将表征存入Redis
+# -------------------
+def save_to_redis(user_reprs):
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+        # 先清空已有数据
+        r.flushdb()
+
+        # 存储用户表征
+        pipe = r.pipeline()
+        for user_id, repr_vector in tqdm(user_reprs.items(), desc="存储到Redis"):
+            key = f"user:{user_id}"
+            pipe.set(key, json.dumps(repr_vector))
+
+        # 执行批量操作
+        pipe.execute()
+        print(f"成功将 {len(user_reprs)} 条用户表征存入Redis")
+    except Exception as e:
+        print(f"存储到Redis失败: {e}")
+
+
+# -------------------
+# 11. 主函数
+# -------------------
+def main():
+    # 检查是否有GPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    # 创建保存模型的目录
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    # 创建数据集和加载器
+    dataset = BPRDataset(user_seqs)
+
+    # 划分训练集和验证集
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=4
+    )
+
+    # 初始化模型
+    model = DualTowerModel(n_items, n_categories).to(device)
+
+    # 初始化优化器和损失函数
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = BPRLoss()
+
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=1, verbose=True
+    )
+
+    # 训练循环
+    best_val_loss = float('inf')
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+
+        # 训练
+        train_loss = train(model, train_loader, optimizer, criterion, device)
+
+        # 在每个epoch结束时更新MoE负载均衡统计
+        model.update_moe_balancing()
+
+        # 验证
+        val_loss = validate(model, val_loader, criterion, device)
+
+        print(f"训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}")
+
+        # 学习率调整
+        scheduler.step(val_loss)
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "best_model.pth"))
+            print("保存最佳模型")
+
+        # 每个epoch开始重置MoE计数
+        model.reset_moe_counts()
+
+    # 加载最佳模型
+    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "best_model.pth")))
+
+    # 离线生成用户长期兴趣表征
+    print("\n生成用户长期兴趣表征...")
+    user_reprs = generate_user_representations(model, user_seqs, device)
+
+    # 保存到Redis
+    print("\n将用户表征存入Redis...")
+    save_to_redis(user_reprs)
+
+    # 保存模型最终版本
+    torch.save(model.state_dict(), os.path.join(MODEL_DIR, "final_model.pth"))
+    print("\n训练完成!")
+
+
+if __name__ == "__main__":
+    main()
