@@ -141,6 +141,25 @@ class Gate(nn.Module):
         self.gate_weights = nn.Linear(args.dim, args.n_routed_experts)
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
 
+        # 添加专家使用频率统计
+        self.register_buffer('expert_activation_counts', torch.zeros(args.n_routed_experts))
+        self.register_buffer('expert_percentages', torch.ones(args.n_routed_experts))
+        self.total_activations = 0
+        self.use_load_balancing = True
+
+    def update_expert_percentages(self):
+        """更新专家使用百分比"""
+        if self.total_activations > 0:
+            # 计算每个专家的激活百分比
+            self.expert_percentages = self.expert_activation_counts / self.total_activations
+            # 为避免除零错误,确保没有零百分比
+            self.expert_percentages = torch.clamp(self.expert_percentages, min=1e-5)
+
+    def reset_counts(self):
+        """重置专家计数,通常在每个epoch开始时调用"""
+        self.expert_activation_counts.zero_()
+        self.total_activations = 0
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the gating mechanism.
@@ -152,10 +171,23 @@ class Gate(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
         scores = self.gate_weights(x)
-        scores = scores.sigmoid()
+
+        # 如果在训练模式且启用负载均衡,应用负载均衡修正
+        if self.training and self.use_load_balancing:
+            # 对scores进行sigmoid操作
+            scores = scores.sigmoid()
+
+            # 使用专家百分比进行负载均衡调整
+            # 百分比越高的专家,其score越小
+            scores = scores / self.expert_percentages.to(scores.device)
+        else:
+            scores = scores.sigmoid()
+
         original_scores = scores
+
         if self.bias is not None:
             scores = scores + self.bias
+
         if self.n_groups > 1:
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
@@ -165,11 +197,25 @@ class Gate(nn.Module):
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+
         indices = torch.topk(scores, self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
+
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+
         weights *= self.route_scale
+
+        # 在训练阶段统计专家激活次数
+        if self.training:
+            # 获取选中的每个专家的索引
+            flat_indices = indices.flatten()
+            # 统计每个专家的激活次数
+            for expert_idx in range(self.expert_activation_counts.size(0)):
+                self.expert_activation_counts[expert_idx] += (flat_indices == expert_idx).sum().item()
+            # 更新总激活次数
+            self.total_activations += flat_indices.size(0)
+
         return weights.type_as(x), indices
 
 
@@ -203,8 +249,15 @@ class MoE(nn.Module):
              for i in range(self.n_routed_experts)])
         self.shared_experts = Expert(args.dim, args.n_shared_experts * args.inter_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def update_expert_percentages(self):
+        """更新专家使用比例"""
+        self.gate.update_expert_percentages()
 
+    def reset_counts(self):
+        """重置专家激活计数"""
+        self.gate.reset_counts()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
@@ -219,6 +272,3 @@ class MoE(nn.Module):
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
         return (y + z).view(shape)
-
-
-
