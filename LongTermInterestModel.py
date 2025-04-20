@@ -196,18 +196,45 @@ class Transformer(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(dims)
         self.layers = nn.ModuleList([])
+
+        # 为MoE层创建合适的配置
+        moe_args = ModelArgs(
+            dim=dims,
+            inter_dim=dims * 4,  # 通常FFN的中间层是维度的4倍
+            moe_inter_dim=dims * 4,
+            n_routed_experts=10,  # 可根据需要调整
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            score_func="sigmoid",
+            route_scale=1.0
+        )
+
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention_RoPE(dim=dims, heads=heads, dim_head=dim_head, att_dropout=dropout, out_dropout=dropout),
-                MoE(),
+                MoE(moe_args),  # 使用配置初始化MoE
             ]))
 
+        # 存储所有MoE层的引用，方便更新负载均衡
+        self.moe_layers = [layer[1] for layer in self.layers]
+
     def forward(self, x):
-        for attn, ff, conv in self.layers:
-            x = attn(x)
-            x = ff(x)
+        for attn, ff in self.layers:
+            x = x + attn(x)  # 残差连接
+            x = x + ff(x)  # 残差连接
 
         return self.norm(x)
+
+    def update_moe_balancing(self):
+        """更新所有MoE层的负载均衡"""
+        for moe in self.moe_layers:
+            moe.update_expert_percentages()
+
+    def reset_moe_counts(self):
+        """重置所有MoE层的激活计数"""
+        for moe in self.moe_layers:
+            moe.reset_counts()
 
 
 class LongTermInterestEncoder(nn.Module):
@@ -232,7 +259,6 @@ class LongTermInterestEncoder(nn.Module):
         # 可学习的 CLS token，用于聚合序列信息
         self.cls_token = nn.Parameter(torch.randn(1, 1, dims))
         # Transformer 编码器，内部包含 Attention_RoPE + MoE
-        # 假设已在全局范围定义 Transformer 模块
         self.transformer = Transformer(
             dims=dims,
             depth=depth,
@@ -243,6 +269,14 @@ class LongTermInterestEncoder(nn.Module):
         # 将 CLS 输出映射到目标维度
         self.proj = nn.Linear(dims, output_dim)
         self.norm = nn.LayerNorm(output_dim)
+
+    def update_moe_balancing(self):
+        """更新transformer中所有MoE层的负载均衡"""
+        self.transformer.update_moe_balancing()
+
+    def reset_moe_counts(self):
+        """重置transformer中所有MoE层的激活计数"""
+        self.transformer.reset_moe_counts()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -265,3 +299,4 @@ class LongTermInterestEncoder(nn.Module):
         out = self.norm(out)
         out = F.normalize(out, p=2, dim=-1)  # 提前用L2归一化，方便后续计算余弦相似度
         return out
+
